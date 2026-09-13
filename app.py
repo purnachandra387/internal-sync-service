@@ -10,11 +10,13 @@ a third-party/vendor system with an internal data store and exposing
 that integration as a simple internal service.
 """
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import requests
 import sqlite3
 import datetime
 import logging
+
+import salesforce_client
 
 app = Flask(__name__)
 
@@ -43,7 +45,18 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             synced_at TEXT,
             record_count INTEGER,
-            status TEXT
+            status TEXT,
+            source TEXT DEFAULT 'github'
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS salesforce_contacts (
+            sf_id TEXT PRIMARY KEY,
+            name TEXT,
+            email TEXT,
+            phone TEXT,
+            title TEXT,
+            last_modified TEXT
         )
     """)
     conn.commit()
@@ -81,12 +94,12 @@ def upsert_repos(repos):
     conn.close()
 
 
-def log_sync(record_count, status):
+def log_sync(record_count, status, source="github"):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO sync_log (synced_at, record_count, status) VALUES (?, ?, ?)",
-        (datetime.datetime.utcnow().isoformat(), record_count, status),
+        "INSERT INTO sync_log (synced_at, record_count, status, source) VALUES (?, ?, ?, ?)",
+        (datetime.datetime.utcnow().isoformat(), record_count, status, source),
     )
     conn.commit()
     conn.close()
@@ -124,16 +137,30 @@ def status():
     cur = conn.cursor()
 
     cur.execute("SELECT COUNT(*) FROM repos")
-    record_count = cur.fetchone()[0]
+    repo_count = cur.fetchone()[0]
 
-    cur.execute("SELECT synced_at, status FROM sync_log ORDER BY id DESC LIMIT 1")
-    last_sync = cur.fetchone()
+    cur.execute("SELECT COUNT(*) FROM salesforce_contacts")
+    contact_count = cur.fetchone()[0]
+
+    cur.execute("SELECT synced_at, status, source FROM sync_log WHERE source='github' ORDER BY id DESC LIMIT 1")
+    last_github_sync = cur.fetchone()
+
+    cur.execute("SELECT synced_at, status, source FROM sync_log WHERE source='salesforce' ORDER BY id DESC LIMIT 1")
+    last_sf_sync = cur.fetchone()
+
     conn.close()
 
     return jsonify({
-        "record_count": record_count,
-        "last_sync_at": last_sync[0] if last_sync else None,
-        "last_sync_status": last_sync[1] if last_sync else "never synced",
+        "github": {
+            "record_count": repo_count,
+            "last_sync_at": last_github_sync[0] if last_github_sync else None,
+            "last_sync_status": last_github_sync[1] if last_github_sync else "never synced",
+        },
+        "salesforce": {
+            "record_count": contact_count,
+            "last_sync_at": last_sf_sync[0] if last_sf_sync else None,
+            "last_sync_status": last_sf_sync[1] if last_sf_sync else "never synced",
+        },
     }), 200
 
 
@@ -152,11 +179,111 @@ def list_repos():
     ]), 200
 
 
+def upsert_salesforce_contacts(contacts):
+    """Insert or update Salesforce Contact records in the local SQLite store."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    for c in contacts:
+        cur.execute("""
+            INSERT INTO salesforce_contacts (sf_id, name, email, phone, title, last_modified)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sf_id) DO UPDATE SET
+                name=excluded.name,
+                email=excluded.email,
+                phone=excluded.phone,
+                title=excluded.title,
+                last_modified=excluded.last_modified
+        """, (
+            c.get("Id"),
+            c.get("Name"),
+            c.get("Email"),
+            c.get("Phone"),
+            c.get("Title"),
+            c.get("LastModifiedDate"),
+        ))
+    conn.commit()
+    conn.close()
+
+
+@app.route("/salesforce/sync", methods=["POST", "GET"])
+def salesforce_sync():
+    """Pull Contact records from Salesforce (vendor system) into the local store."""
+    try:
+        contacts = salesforce_client.fetch_contacts(limit=25)
+        upsert_salesforce_contacts(contacts)
+        log_sync(len(contacts), "success", source="salesforce")
+        logger.info(f"Synced {len(contacts)} Salesforce contacts.")
+        return jsonify({
+            "status": "success",
+            "synced": len(contacts),
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+        }), 200
+
+    except salesforce_client.SalesforceAuthError as e:
+        logger.error(f"Salesforce auth failed: {e}")
+        log_sync(0, "auth_failed", source="salesforce")
+        return jsonify({"status": "error", "message": "Salesforce authentication failed.", "detail": str(e)}), 401
+
+    except salesforce_client.SalesforceAPIError as e:
+        logger.error(f"Salesforce API call failed: {e}")
+        log_sync(0, "failed", source="salesforce")
+        return jsonify({"status": "error", "message": "Salesforce API call failed.", "detail": str(e)}), 502
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Network error reaching Salesforce: {e}")
+        log_sync(0, "failed", source="salesforce")
+        return jsonify({"status": "error", "message": "Could not reach Salesforce.", "detail": str(e)}), 502
+
+
+@app.route("/salesforce/contacts", methods=["GET"])
+def salesforce_contacts():
+    """List locally stored Salesforce contacts (the internal view of vendor data)."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT sf_id, name, email, phone, title, last_modified FROM salesforce_contacts ORDER BY name")
+    rows = cur.fetchall()
+    conn.close()
+
+    return jsonify([
+        {"id": r[0], "name": r[1], "email": r[2], "phone": r[3], "title": r[4], "last_modified": r[5]}
+        for r in rows
+    ]), 200
+
+
+@app.route("/salesforce/contacts", methods=["POST"])
+def salesforce_create_contact():
+    """
+    Create a Contact in Salesforce from a JSON body:
+    {"first_name": "...", "last_name": "...", "email": "..."}
+    Demonstrates writing to the vendor system, not just reading from it.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    first_name = data.get("first_name")
+    last_name = data.get("last_name")
+    email = data.get("email")
+
+    if not last_name:
+        return jsonify({"status": "error", "message": "last_name is required."}), 400
+
+    try:
+        result = salesforce_client.create_contact(first_name, last_name, email)
+        return jsonify({"status": "success", "salesforce_id": result.get("id")}), 201
+
+    except salesforce_client.SalesforceAuthError as e:
+        return jsonify({"status": "error", "message": "Salesforce authentication failed.", "detail": str(e)}), 401
+
+    except salesforce_client.SalesforceAPIError as e:
+        return jsonify({"status": "error", "message": "Salesforce API call failed.", "detail": str(e)}), 502
+
+
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
         "service": "internal-sync-service",
-        "endpoints": ["/sync", "/status", "/repos"],
+        "endpoints": [
+            "/sync", "/status", "/repos",
+            "/salesforce/sync", "/salesforce/contacts",
+        ],
     }), 200
 
 
